@@ -1,0 +1,129 @@
+# Builds the statically linked release binaries and publishes them to a
+# GitHub release. Triggered by pushing a version tag, for example:
+#
+#   git tag -a v1.0.1 -m "go-init v1.0.1" && git push origin v1.0.1
+#
+# Actions are pinned to a commit SHA so a moved tag cannot change what runs
+# here. The trailing comment records the human readable version.
+
+name: Release
+
+on:
+  push:
+    tags: [ 'v*' ]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to stamp into the binaries (e.g. v1.0.1). Builds the artifacts without publishing a release.'
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      # Needed to create the release and upload the binaries.
+      contents: write
+      # Needed to attest where the binaries were built.
+      id-token: write
+      attestations: write
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+    - name: Set up Go
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with:
+        go-version: '1.26'
+
+    # Read the version through the environment rather than interpolating it
+    # into the script, so that the workflow_dispatch input cannot inject shell.
+    - name: Resolve version
+      id: version
+      env:
+        INPUT_VERSION: ${{ inputs.version }}
+      run: |
+        version="${INPUT_VERSION:-$GITHUB_REF_NAME}"
+        echo "Building version ${version}"
+        echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+    - name: Vet
+      run: go vet ./...
+
+    - name: Test
+      run: go test -race ./...
+
+    - name: Check for known vulnerabilities
+      run: |
+        go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+        "$(go env GOPATH)/bin/govulncheck" ./...
+
+    # CGO is disabled so the binaries are static and run in any image,
+    # including scratch and distroless ones. -trimpath keeps runner paths out
+    # of the result.
+    - name: Build binaries
+      env:
+        VERSION: ${{ steps.version.outputs.version }}
+      run: |
+        set -euo pipefail
+        mkdir -p dist
+        printf '%s\n' \
+          "linux amd64 " \
+          "linux arm64 " \
+          "linux arm 7" \
+          "linux 386 " \
+          "linux ppc64le " \
+          "linux s390x " \
+          "linux riscv64 " |
+        while read -r goos goarch goarm; do
+          name="go-init-${goos}-${goarch}"
+          if [ -n "${goarm}" ]; then
+            name="${name}v${goarm}"
+          fi
+          echo "Building ${name}"
+          CGO_ENABLED=0 GOOS="${goos}" GOARCH="${goarch}" GOARM="${goarm}" \
+            go build -trimpath \
+              -ldflags="-s -w -X 'main.versionString=${VERSION}'" \
+              -o "dist/${name}" .
+        done
+        cd dist
+        sha256sum go-init-* > SHA256SUMS
+        ls -l
+        cat SHA256SUMS
+
+    # Confirms the binary that was just built reports the version it was
+    # stamped with, so a broken ldflags change cannot ship silently.
+    - name: Smoke test the native binary
+      env:
+        VERSION: ${{ steps.version.outputs.version }}
+      run: |
+        set -euo pipefail
+        got="$(./dist/go-init-linux-amd64 -version)"
+        if [ "${got}" != "${VERSION}" ]; then
+          echo "version mismatch: binary reported '${got}', expected '${VERSION}'"
+          exit 1
+        fi
+        ./dist/go-init-linux-amd64 -main "/bin/echo release smoke test ok"
+
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: go-init-${{ steps.version.outputs.version }}
+        path: dist/
+
+    - name: Publish release
+      if: github.event_name == 'push'
+      uses: softprops/action-gh-release@fe965f7af51af5f2602596916f38a38df2e33de0 # v3.0.2
+      with:
+        files: |
+          dist/go-init-*
+          dist/SHA256SUMS
+        generate_release_notes: true
+
+    - name: Attest build provenance
+      if: github.event_name == 'push'
+      uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+      with:
+        subject-path: dist/go-init-*
